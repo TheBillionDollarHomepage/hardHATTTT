@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.14;
 
-import {ISuperfluid, ISuperToken, ISuperApp, ISuperAgreement, SuperAppDefinitions} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/superfluid/ISuperfluid.sol";
+import {ISuperfluid, ISuperToken, ISuperApp, ISuperAgreement, SuperAppDefinitions, ISuperfluidToken} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/superfluid/ISuperfluid.sol";
 
 import {CFAv1Library} from "@superfluid-finance/ethereum-contracts/contracts/apps/CFAv1Library.sol";
 
 import {IConstantFlowAgreementV1} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/agreements/IConstantFlowAgreementV1.sol";
 
 import {SuperAppBase} from "@superfluid-finance/ethereum-contracts/contracts/apps/SuperAppBase.sol";
+
+import {BillionDollarCanvas} from "./BillionDollarCanvas.sol";
 
 /// @dev Constant Flow Agreement registration key, used to get the address from the host.
 bytes32 constant CFA_ID = keccak256("org.superfluid-finance.agreements.ConstantFlowAgreement.v1");
@@ -40,10 +42,13 @@ contract RedirectAll is SuperAppBase {
     /// @notice This is the current receiver that all streams will be redirected to.
     address public _receiver;
 
+    BillionDollarCanvas billionDollarCanvas;
+
     constructor(
         ISuperfluid host,
         ISuperToken acceptedToken,
-        address receiver
+        address receiver,
+        address canvasContract
     ) {
         assert(address(host) != address(0));
         assert(address(acceptedToken) != address(0));
@@ -51,6 +56,7 @@ contract RedirectAll is SuperAppBase {
 
         _acceptedToken = acceptedToken;
         _receiver = receiver;
+        billionDollarCanvas = BillionDollarCanvas(canvasContract);
 
         cfaV1Lib = CFAv1Library.InitData({
             host: host,
@@ -123,7 +129,7 @@ contract RedirectAll is SuperAppBase {
         ISuperToken _superToken,
         address _agreementClass,
         bytes32, //_agreementId
-        bytes calldata, //_agreementData
+        bytes calldata _agreementData,
         bytes calldata, //_cbdata
         bytes calldata _ctx
     )
@@ -133,6 +139,33 @@ contract RedirectAll is SuperAppBase {
         onlyHost
         returns (bytes memory newCtx)
     {
+        // decode data from context
+        (address sender, address receiver) = abi.decode(
+            _agreementData,
+            (address, address)
+        );
+        ISuperfluid.Context memory context = ISuperfluid(msg.sender).decodeCtx(_ctx);
+        (uint256 canvasId, string memory uri, uint256 price) = abi.decode(
+            context.userData,
+            (uint256, string, uint256)
+        );
+
+        // logic for buying canvas
+        (, int96 outFlowRate, , ) = cfaV1Lib.cfa.getFlow(_acceptedToken, sender, receiver);
+        require(outFlowRate >= billionDollarCanvas.getFeePerSecond(canvasId));
+
+        address moneyReceiver;
+
+        try billionDollarCanvas.ownerOfCanvas(canvasId) {
+            moneyReceiver = billionDollarCanvas.ownerOf(canvasId);
+        } catch {
+            moneyReceiver = billionDollarCanvas.getGitCoinAddress();
+        }
+
+        _acceptedToken.transferFrom(context.msgSender, moneyReceiver, price);
+
+        billionDollarCanvas.buyFor(context.msgSender, canvasId, uri, price);
+
         return _updateOutflow(_ctx);
     }
 
@@ -150,6 +183,19 @@ contract RedirectAll is SuperAppBase {
         onlyHost
         returns (bytes memory newCtx)
     {
+        // decode data from context
+        ISuperfluid.Context memory context = ISuperfluid(msg.sender).decodeCtx(_ctx);
+        (uint256 canvasId, uint256 price) = abi.decode(
+            context.userData,
+            (uint256, uint256)
+        );
+
+        // logic for updating stream -> chaning price
+        (, int96 outFlowRate, , ) = cfaV1Lib.cfa.getFlow(_acceptedToken, sender, receiver);
+        require(outFlowRate >= billionDollarCanvas.getFeePerSecond(canvasId));
+
+        billionDollarCanvas.setPrice(canvasId, price);
+
         return _updateOutflow(_ctx);
     }
 
@@ -166,6 +212,16 @@ contract RedirectAll is SuperAppBase {
             return _ctx;
         }
 
+        // decode data from context
+        ISuperfluid.Context memory context = ISuperfluid(msg.sender).decodeCtx(_ctx);
+        (address sender, uint256 canvasId) = abi.decode(
+            context.userData,
+            (address, uint256)
+        );
+
+        // when stream is termimated reset canvas and give it free for initial selling
+        billionDollarCanvas.resetCanvas(canvasId, 0);
+
         return _updateOutflow(_ctx);
     }
 
@@ -176,7 +232,7 @@ contract RedirectAll is SuperAppBase {
     /// @param newReceiver The new receiver to redirect to.
     function _changeReceiver(address newReceiver) internal {
         if (newReceiver == address(0)) revert InvalidReceiver();
-
+getFlow
         if (cfaV1Lib.host.isApp(ISuperApp(newReceiver))) revert ReceiverIsSuperApp();
 
         if (newReceiver == _receiver) return;
